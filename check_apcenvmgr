@@ -1,0 +1,456 @@
+#!/usr/bin/perl
+
+
+# CHANGE LOG
+# ----------
+# 2012/11/13	njeffrey	Script created to monitor ambient temperature on APC UPS with environmental monitoring card
+# 2013/08/14	njeffrey	Add capability to monitor UPS runtime, battery status
+# 2016/02/16	njeffrey	Add capability to monitor dry contacts (for water sensor)
+# 2016/02/16	njeffrey	Confirm $snmpwalk exists
+# 2018/04/08	njeffrey	Bug fixes in print_output subroutine, add --verbose parameter
+# 2018/07/07	njeffrey	Add nagios performance data to output
+# 2019/04/09	njeffrey	Rework script to monitor APC PDU instead of UPS
+# 2022/06/14	njeffrey	Rework script to monitor APC 9340 Environmental Manager
+
+
+# nagios shell script to query APC AP9430 Environmental Manager for temperature and humidity readings
+
+
+# NOTES
+# -----
+#
+#  This script should return one (and only one) line of ouput.  Multiple  lines of output are silently ignored by nagios.
+#
+#  The line of output will become the body of the alert message sent by nagios
+#
+#
+#  This script queries a remote host via SNMP
+#
+#  You will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#      # Define a service to check the APC Environmental Manager
+#      # Parameters are SNMP community name
+#      define service {
+#              use                             generic-service
+#              hostgroup_name                  all_apcenvmgr
+#              service_description             APC Environmental Manager
+#              check_command                   check_apcenvmgr!public
+#              }
+#
+#
+#  You will also need a command definition similar to the following in commands.cfg on the nagios server
+#      # 'check_apcenvmgr' command definition
+#      # parameters are -H hostname -C snmp_community
+#      define command{
+#              command_name    check_apcenvmgr
+#              command_line    $USER1$/check_apcenvmgr -H $HOSTADDRESS$ -C $ARG1$
+#              }
+#
+#
+
+# Different APC Environmental Managers may use slightly different OID values.  Here are a few:
+#  AP9340 
+#     iso.org.dod.internet.private.enterprises.apc.producs.hardware.environmentalMonitor               			.1.3.6.1.4.1.318.1.1.10
+#     iso.org.dod.internet.private.enterprises.apc.producs.hardware.environmentalMonitor.external      			.1.3.6.1.4.1.318.1.1.10.1
+#     iso.org.dod.internet.private.enterprises.apc.producs.hardware.environmentalMonitor.internal      			.1.3.6.1.4.1.318.1.1.10.2
+#     iso.org.dod.internet.private.enterprises.apc.producs.hardware.environmentalMonitor.envMgtSystem  			.1.3.6.1.4.1.318.1.1.10.3
+#     iso.org.dod.internet.private.enterprises.apc.producs.hardware.environmentalMonitor.modEnvMgr     			.1.3.6.1.4.1.318.1.1.10.4
+#     iso.org.dod.internet.private.enterprises.apc.producs.hardware.environmentalMonitor.modEnvMgr.memModules   	.1.3.6.1.4.1.318.1.1.10.4.1
+#     iso.org.dod.internet.private.enterprises.apc.producs.hardware.environmentalMonitor.modEnvMgr.memSensors   	.1.3.6.1.4.1.318.1.1.10.4.2
+#     iso.org.dod.internet.private.enterprises.apc.producs.hardware.environmentalMonitor.modEnvMgr.memInputs	   	.1.3.6.1.4.1.318.1.1.10.4.3
+#     iso.org.dod.internet.private.enterprises.apc.producs.hardware.environmentalMonitor.modEnvMgr.memOutputs   	.1.3.6.1.4.1.318.1.1.10.4.4
+#     iso.org.dod.internet.private.enterprises.apc.producs.hardware.environmentalMonitor.modEnvMgr.memOutlets   	.1.3.6.1.4.1.318.1.1.10.4.5
+#     iso.org.dod.internet.private.enterprises.apc.producs.hardware.environmentalMonitor.modEnvMgr.memBeacons   	.1.3.6.1.4.1.318.1.1.10.4.6
+# 
+#     iso.org.dod.internet.private.enterprises.apc.producs.hardware.environmentalMonitor.modEnvMgr.memSensors.memSensorsStatusSysTempUnits   	.1.3.6.1.4.1.318.1.1.10.4.2.1  1=Celsius 2=Fahreneight
+#     iso.org.dod.internet.private.enterprises.apc.producs.hardware.environmentalMonitor.modEnvMgr.memSensors.memSensorsStatusTableSize   	.1.3.6.1.4.1.318.1.1.10.4.2.2  Number of entries in the memSensorsStatusTable
+#     iso.org.dod.internet.private.enterprises.apc.producs.hardware.environmentalMonitor.modEnvMgr.memSensors.memSensorsStatusTable 	  	.1.3.6.1.4.1.318.1.1.10.4.2.3  Allows for getting sensor status information
+#     iso.org.dod.internet.private.enterprises.apc.producs.hardware.environmentalMonitor.modEnvMgr.memSensors.memSensorsConfigTableSize   	.1.3.6.1.4.1.318.1.1.10.4.2.4  Number of entries in the memSensorsConfigTabble
+#     iso.org.dod.internet.private.enterprises.apc.producs.hardware.environmentalMonitor.modEnvMgr.memSensors.memSensorsConfigTable   		.1.3.6.1.4.1.318.1.1.10.4.2.5  Allows for getting config info from attached sensors
+#
+#     Example:
+#     $ snmpwalk -v 1 -c public 198.18.18.6 .1.3.6.1.4.1.318.1.1.10.4.2.1
+#     SNMPv2-SMI::enterprises.318.1.1.10.4.2.1.0 = INTEGER: 1                     1=Celsius 2=Fahrenheit
+#
+#     $ snmpwalk -v 1 -c public 198.18.18.6 .1.3.6.1.4.1.318.1.1.10.4.2.3
+#     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.1.0.1 = INTEGER: 0
+#     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.1.0.2 = INTEGER: 0
+#     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.2.0.1 = INTEGER: 1
+#     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.2.0.2 = INTEGER: 2
+#     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.3.0.1 = STRING: "Rack1 front"    <---- text label for first sensor
+#     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.3.0.2 = STRING: "Rack1 rear"     <---- text label for second sensor
+#     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.4.0.1 = STRING: "Unknown"
+#     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.4.0.2 = STRING: "Unknown"
+#     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.5.0.1 = INTEGER: 32              <---- degrees temperature (Celsius or Fahrenheit determined earlier)
+#     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.5.0.2 = INTEGER: 33              <---- degrees temperature (Celsius or Fahrenheit determined earlier)
+#     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.6.0.1 = INTEGER: -1              <---- value of -1 indicates that sensor is temperature only, no humidity sensor
+#     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.6.0.2 = INTEGER: 21              <---- relative humidity value in %
+#     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.7.0.1 = INTEGER: 2
+#     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.7.0.2 = INTEGER: 2
+#     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.8.0.1 = INTEGER: 3
+#     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.8.0.2 = INTEGER: 1
+#
+
+
+
+
+
+
+
+
+
+
+use strict;				#enforce good coding practices
+use Getopt::Long;                       #allow --long-switches to be used as parameters.  Install with: perl -MCPAN -e 'install Getopt::Long'
+
+
+
+# declare variables
+my ($OK,$WARN,$CRITICAL,$UNKNOWN);
+my ($CHECK_NAME,$cmd,$snmpwalk,$snmpget);
+my ($host,$oid,$key,%device,$community);
+my ($opt_h,$opt_v,$opt_C,$opt_H);
+my ($temperature_warn_C,$temperature_warn_F);
+my ($verbose,$output_details,$perf_data);
+$cmd = "";                                              #initialize variable
+$CHECK_NAME                 = "APC EnvMgr";		#name of nagios check
+$verbose                    = "no";                    	#yes/no variable to increase output for debugging
+$community                  = "public";  		#default SNMP community name
+$output_details             = "";			#initialize variable to hold details of script output
+$snmpwalk                   = "/usr/bin/snmpwalk";	#location of binary
+$snmpget                    = "/usr/bin/snmpget";	#location of binary
+$temperature_warn_C         = 30;			#degrees C warning threshold
+$temperature_warn_F         = 86;			#degrees F warning threshold
+#
+# Nagios return codes
+#
+$OK=            0;
+$WARN=          1;
+$CRITICAL=      2;
+$UNKNOWN=       3;
+
+
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   #
+   print "running get_options subroutine \n" if ($verbose eq "yes");
+   #
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"        => \$opt_h,
+      "v"   => \$opt_v, "verbose"     => \$opt_v,
+      "C=s" => \$opt_C, "community=s" => \$opt_C, "comm=s" => \$opt_C,
+      "H=s" => \$opt_H, "hostname=s"  => \$opt_H, "host=s" => \$opt_H,
+   );
+   #
+   #
+   #
+   # If the user supplied -h or --help, generate the help messages
+   #
+   if( defined( $opt_h ) ) {
+      print "Nagios plugin for determining APC AP9340 Environmental Manager temperature readings. \n";
+      print "Examples: \n";
+      print "   $0 --host=myhost --community=public \n";
+      print "   $0     -H myhost          -C public \n";
+      print "\n\n";
+      exit $UNKNOWN;
+   }
+   #
+   # If the user supplied -v or --verbose, increase verbosity for debugging
+   if( defined( $opt_v ) ) {
+      $verbose = "yes";
+   } 
+   #
+   #
+   # If the user did not supply a --community SNMP community string, use "public"
+   #
+   if( defined( $opt_C ) ) {
+      $community = $opt_C;
+   } else {
+      $community = "public";
+   }
+   #
+   # If the user did not supply a --host=??? , generate a warning
+   #
+   if( defined( $opt_H ) ) {
+      $host = $opt_H;
+   } else {
+      print "$CHECK_NAME UNKNOWN - a remote host to check was not provided. Use this syntax: $0 -H hostname -C snmp_community\n";
+      exit $CRITICAL;                                           #exit script
+   }
+   #
+   print "host=$host community=$community \n" if ($verbose eq "yes");
+}                       #end of subroutine
+
+
+
+
+
+sub sanity_checks {
+   #
+   #
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   if ( ! -f "$snmpwalk" ) {
+      print "ERROR: Cannot find $snmpwalk \n";
+      exit;
+   }
+   if ( ! -x "$snmpwalk" ) {
+      print "ERROR: $snmpwalk is not executable by the current user\n";
+      exit;
+   }
+   if ( ! -f "$snmpget" ) {
+      print "ERROR: Cannot find $snmpget \n";
+      exit;
+   }
+   if ( ! -x "$snmpget" ) {
+      print "ERROR: $snmpget is not executable by the current user\n";
+      exit;
+   }
+}                                                       #end of subroutine
+
+
+
+
+sub check_model {
+   #
+   # query the SNMP OID to confirm this is the correct device model
+   # This uses the APC PowerNet MIB
+   #
+   # Sample output:
+   #  $ snmpget -v 1 -c public 198.18.18.6 .1.3.6.1.4.1.318.1.1.10.3.1.2.0
+   #  SNMPv2-SMI::enterprises.318.1.1.10.3.1.2.0 = STRING: "AP9340"
+   #
+   print "running check_model subroutine \n" if ($verbose eq "yes");
+   #
+   $oid = ".1.3.6.1.4.1.318.1.1.10.3.1.2.0";                             
+   $cmd = "$snmpget -On -v 1 -c $community $host $oid";
+   print "   Checking model number with: $cmd \n" if ($verbose eq "yes");
+   $device{model} = "unknown";				#initialize variable
+   #
+   open(IN,"$cmd |");                                                   #get the index numbers of the LUNs
+   while (<IN>) {                                                       #read a line from the command output
+      s/\"//g;                                                          #get rid of quotation marks
+      if ( /$oid = STRING: ([A-Z0-9]+)/ ) {         			#value returned will be the model number
+         $device{model} = $1;   	         			#assign value to hash
+         print "   Model number: $device{model} \n" if ($verbose eq "yes");
+      }
+   }                                                                    #end of while loop
+   close IN;								#close filehandle
+   if ( $device{model} ne "AP9340" ) {
+      print "$CHECK_NAME UNKNOWN - this check is only tested against the APC AP9340 Environmental Management device.  This device model is $device{model} \n";
+      exit $UNKNOWN; 
+   }
+}									#end of subroutine 
+
+
+
+
+sub check_temperature_units {
+   #
+   # Figure out the temperature units are in Celsius or Fahrenheit
+   #     Example:
+   #     $ snmpwalk -v 1 -c public 198.18.18.6 .1.3.6.1.4.1.318.1.1.10.4.2.1.0
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.1.0 = INTEGER: 1                     1=Celsius 2=Fahrenheit
+   #
+   print "running check_temperature_units subroutine \n" if ($verbose eq "yes");
+   #
+   $oid = ".1.3.6.1.4.1.318.1.1.10.4.2.1.0";                             
+   $cmd = "$snmpget -On -v 1 -c $community $host $oid";
+   print "   Checking model number with: $cmd \n" if ($verbose eq "yes");
+   $device{temperatureunits} = "unknown";				#initialize variable
+   #
+   open(IN,"$cmd |");                                                   #get the index numbers of the LUNs
+   while (<IN>) {                                                       #read a line from the command output
+      s/\"//g;                                                          #get rid of quotation marks
+      if ( /$oid = INTEGER: ([0-9]+)/ ) {         			#value returned will be the model number
+         $device{temperatureunits} = $1;   	         			#assign value to hash
+         $device{temperatureunits} = "C" if ($device{temperatureunits} eq "1"); #replace integer with human readable text
+         $device{temperatureunits} = "F" if ($device{temperatureunits} eq "2"); #replace integer with human readable text
+         print "   Temperature units: $device{temperatureunits} \n" if ($verbose eq "yes");
+      }
+   }                                                                    #end of while loop
+   close IN;								#close filehandle
+   if ( ($device{temperatureunits} ne "C") && ($device{temperatureunits} ne "F") ) {
+      print "$CHECK_NAME UNKNOWN - could not determine if temperature units are Celsius or Fahrenheit \n";
+      exit $UNKNOWN; 
+   }
+}									#end of subroutine 
+
+
+
+sub check_sensor1 {
+   #
+   #  Sample output:
+   #     $ snmpwalk -v 1 -c public 198.18.18.6 .1.3.6.1.4.1.318.1.1.10.4.2.3
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.1.0.1 = INTEGER: 0
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.1.0.2 = INTEGER: 0
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.2.0.1 = INTEGER: 1
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.2.0.2 = INTEGER: 2
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.3.0.1 = STRING: "Rack1 front"    <---- text label for first sensor
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.3.0.2 = STRING: "Rack1 rear"     <---- text label for second sensor
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.4.0.1 = STRING: "Unknown"
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.4.0.2 = STRING: "Unknown"
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.5.0.1 = INTEGER: 32              <---- degrees temperature (Celsius or Fahrenheit determined earlier)
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.5.0.2 = INTEGER: 33              <---- degrees temperature (Celsius or Fahrenheit determined earlier)
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.6.0.1 = INTEGER: -1              <---- value of -1 indicates that sensor is temperature only, no humidity sensor
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.6.0.2 = INTEGER: 21              <---- relative humidity value in %
+   #
+   #
+   print "running check_sensor1 subroutine \n" if ($verbose eq "yes");
+   #
+   $oid = ".1.3.6.1.4.1.318.1.1.10.4.2.3.1.3.0.1";                             
+   $cmd = "$snmpget -On -v 1 -c $community $host $oid";
+   print "   Checking sensor label with: $cmd \n" if ($verbose eq "yes");
+   $device{sensor1}{label} = "unknown";					#initialize variable
+   #
+   open(IN,"$cmd |");                                                   #get the index numbers of the LUNs
+   while (<IN>) {                                                       #read a line from the command output
+      s/\"//g;                                                          #get rid of quotation marks
+      if ( /$oid = STRING: ([a-zA-Z0-9 _\-]+)/ ) {         		#value returned will be the model number
+         $device{sensor1}{label} = $1;   	         		#assign value to hash
+      }
+   }                                                                    #end of while loop
+   close IN;								#close filehandle
+   #
+   $oid = ".1.3.6.1.4.1.318.1.1.10.4.2.3.1.5.0.1";                             
+   $cmd = "$snmpget -On -v 1 -c $community $host $oid";
+   print "   Checking sensor value with: $cmd \n" if ($verbose eq "yes");
+   $device{sensor1}{value} = "unknown";					#initialize variable
+   #
+   open(IN,"$cmd |");                                                   #get the index numbers of the LUNs
+   while (<IN>) {                                                       #read a line from the command output
+      s/\"//g;                                                          #get rid of quotation marks
+      if ( /$oid = INTEGER: ([0-9]+)/ ) {         			#value returned will be the model number
+         $device{sensor1}{value} = $1;   	         		#assign value to hash
+      }
+   }                                                                    #end of while loop
+   close IN;								#close filehandle
+   print "   sensor1 label:$device{sensor1}{label} temperature:$device{sensor1}{value}$device{temperatureunits} \n" if ($verbose eq "yes");
+}									#end of subroutine 
+
+
+
+
+sub check_sensor2 {
+   #
+   #  Sample output:
+   #     $ snmpwalk -v 1 -c public 198.18.18.6 .1.3.6.1.4.1.318.1.1.10.4.2.3
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.1.0.1 = INTEGER: 0
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.1.0.2 = INTEGER: 0
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.2.0.1 = INTEGER: 1
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.2.0.2 = INTEGER: 2
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.3.0.1 = STRING: "Rack1 front"    <---- text label for first sensor
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.3.0.2 = STRING: "Rack1 rear"     <---- text label for second sensor
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.4.0.1 = STRING: "Unknown"
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.4.0.2 = STRING: "Unknown"
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.5.0.1 = INTEGER: 32              <---- degrees temperature (Celsius or Fahrenheit determined earlier)
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.5.0.2 = INTEGER: 33              <---- degrees temperature (Celsius or Fahrenheit determined earlier)
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.6.0.1 = INTEGER: -1              <---- value of -1 indicates that sensor is temperature only, no humidity sensor
+   #     SNMPv2-SMI::enterprises.318.1.1.10.4.2.3.1.6.0.2 = INTEGER: 21              <---- relative humidity value in %
+   #
+   #
+   print "running check_sensor2 subroutine \n" if ($verbose eq "yes");
+   #
+   $oid = ".1.3.6.1.4.1.318.1.1.10.4.2.3.1.3.0.2";                             
+   $cmd = "$snmpget -On -v 1 -c $community $host $oid";
+   print "   Checking sensor label with: $cmd \n" if ($verbose eq "yes");
+   $device{sensor2}{label} = "unknown";					#initialize variable
+   #
+   open(IN,"$cmd |");                                                   #get the index numbers of the LUNs
+   while (<IN>) {                                                       #read a line from the command output
+      s/\"//g;                                                          #get rid of quotation marks
+      if ( /$oid = STRING: ([a-zA-Z0-9 _\-]+)/ ) {         		#value returned will be the model number
+         $device{sensor2}{label} = $1;   	         		#assign value to hash
+      }
+   }                                                                    #end of while loop
+   close IN;								#close filehandle
+   #
+   $oid = ".1.3.6.1.4.1.318.1.1.10.4.2.3.1.5.0.1";                             
+   $cmd = "$snmpget -On -v 1 -c $community $host $oid";
+   print "   Checking sensor value with: $cmd \n" if ($verbose eq "yes");
+   $device{sensor2}{value} = "unknown";					#initialize variable
+   #
+   open(IN,"$cmd |");                                                   #get the index numbers of the LUNs
+   while (<IN>) {                                                       #read a line from the command output
+      s/\"//g;                                                          #get rid of quotation marks
+      if ( /$oid = INTEGER: ([0-9]+)/ ) {         			#value returned will be the model number
+         $device{sensor2}{value} = $1;   	         		#assign value to hash
+      }
+   }                                                                    #end of while loop
+   close IN;								#close filehandle
+   print "   sensor2 label:$device{sensor2}{label} temperature:$device{sensor2}{value}$device{temperatureunits} \n" if ($verbose eq "yes");
+}									#end of subroutine 
+
+
+
+
+sub print_output {
+   #
+   # print output in the format expected by nagios
+   #
+   print "running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   # The nagios performance data will be the same for all the outputs, so just put it in a variable that can be use by all the output options
+   #
+   # The format is:  label=value[UOM];[warn];[crit];[min];[max]
+   # On the "label=value" section is required.  The warn|crit|min|max entries are optional.
+   # You can have multiple items of perf data, just separate each section with a space
+   # UOM is Units Of Measurement.    Can be s=seconds B=bytes MB=megabytes %=percent c=counter
+   # You can use the standard nagios ranges and thresholds formats (examples below)
+   # Range definition	Generate an alert if x...
+   # ----------------   -------------------------
+   # 10	                < 0 or > 10, (outside the range of {0 .. 10})
+   # 10:	        < 10, (outside {10 .. ∞})
+   # ~:10	        > 10, (outside the range of {-∞ .. 10})
+   # 10:20	        < 10 or > 20, (outside the range of {10 .. 20})
+   # @10:20	        ≥ 10 and ≤ 20, (inside the range of {10 .. 20})
+   #
+   $perf_data = "$device{sensor1}{label}=$device{sensor1}{value}c;;;; $device{sensor2}{label}=$device{sensor2}{value}c;;;;$device{temperatureunits}";
+   #
+   #
+   # Much of the text of the output will be the same.  Put the common stuff in a variable so we can simplify the outputs
+   #
+   $output_details = "sensor 1 $device{sensor1}{label} $device{sensor1}{value}$device{temperatureunits} sensor 2 $device{sensor2}{label} $device{sensor2}{value}$device{temperatureunits}";
+   #
+   #
+   if ( $device{temperatureunits} eq "C") {
+      if (  ($device{sensor1}{value} > $temperature_warn_C) || ($device{sensor2}{value} > $temperature_warn_C) ) {
+         print "$CHECK_NAME WARN - high temperature alert.  Please investigate.  $output_details | $perf_data \n";
+         exit $WARN; 
+      }
+   }
+   #
+   if ( $device{temperatureunits} eq "F") {
+      if (  ($device{sensor1}{value} > $temperature_warn_F) || ($device{sensor2}{value} > $temperature_warn_F) ) {
+         print "$CHECK_NAME WARN - high temperature alert.  Please investigate.  $output_details | $perf_data \n";
+         exit $WARN; 
+      }
+   }
+   #
+   #
+   # This message gets sent if everything is ok
+   print "$CHECK_NAME OK - $output_details | $perf_data \n";
+   exit $OK;
+}                                                                       #end of subroutine
+
+
+
+
+
+# --------------------------- main body of program ----------------------
+get_options;
+sanity_checks;
+check_model;
+check_temperature_units;
+check_sensor1;
+check_sensor2;
+print_output;
+
+
+
+
